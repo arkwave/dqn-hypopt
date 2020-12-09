@@ -129,7 +129,8 @@ def initialize_game(params):
     dqn = DQN(num_state, num_action, params) 
     return env, num_state, num_action 
 
-# TODO: include fucns to save logfiles etc 
+
+# TODO: include funcs to save logfiles etc 
 def main(params):
     env, num_state, num_action, DQN = initialize_game(params)
     agent = DQN()
@@ -150,6 +151,7 @@ def main(params):
                     print("episodes {}, step is {} ".format(i_ep, t))
 
 
+# TODO: figure out which of these are unnecessary.
 if __name__ == "__main__":
 
     # parse arguments. 
