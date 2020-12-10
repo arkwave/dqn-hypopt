@@ -16,7 +16,7 @@ import torch.optim as optim
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from tensorboardX import SummaryWriter
 
-# taken from https://github.com/sweetice/Deep-reinforcement-learning-with-pytorch, with modifications.
+# taken from https://github.com/sweetice/Deep-reinforcement-learning-with-pytorch, with heavy modifications.
 
 class Net(nn.Module):
     def __init__(self, num_state, num_action):
@@ -84,10 +84,10 @@ class DQN():
         if self.memory_count >= self.capacity:
 
             # convert inputs to torch tensors. 
-            state = torch.Tensor([t.state for t in self.memory]).float()
+            state = torch.Tensor([t.old_state for t in self.memory]).float()
             action = torch.LongTensor([t.action for t in self.memory]).view(-1,1).long()
             reward = torch.Tensor([t.reward for t in self.memory]).float()
-            next_state = torch.Tensor([t.next_state for t in self.memory]).float()
+            next_state = torch.Tensor([t.new_state for t in self.memory]).float()
         
             # normalize rewards. 
             reward = (reward - reward.mean()) / (reward.std() + 1e-7)
@@ -105,7 +105,7 @@ class DQN():
                 loss.backward()
                 self.optimizer.step()
                 self.writer.add_scalar('loss/value_loss', loss, self.update_count)
-                batch_loss += loss
+                batch_loss += loss.item()
 
             self.losses.append(batch_loss/self.batch_size)
             
@@ -234,6 +234,8 @@ def main(params):
         
         if i_ep % 10 == 9:
             print("episode {},  iteration {} ".format(i_ep, t))
+    
+    return agent 
 
 
 # TODO: figure out which of these are unnecessary.
@@ -267,7 +269,7 @@ if __name__ == "__main__":
     parser.add_argument('--update_count', default=150, type=int) # number of iterations before transferring weights. 
     parser.add_argument('--learning_rate', default=3e-4, type=float) # learning rate for networks. 
     parser.add_argument('--gamma', default=0.99, type=int) # discounted factor
-    parser.add_argument('--capacity', default=50000, type=int) # replay buffer size
+    parser.add_argument('--capacity', default=10, type=int) # replay buffer size
     parser.add_argument('--num_iterations', default=10, type=int) #  num of iterations per episode
     parser.add_argument('--batch_size', default=100, type=int) # mini batch size
     parser.add_argument('--seed', default=True, type=bool) 
@@ -292,6 +294,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # pass args into the main function 
-    main(args)
+    agent = main(args)
     
 
