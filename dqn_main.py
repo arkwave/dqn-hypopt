@@ -3,16 +3,16 @@ import pickle
 from collections import namedtuple
 from itertools import count
 
-import os, time
+import os, time, json
 import numpy as np
 import matplotlib.pyplot as plt
 
 import gym
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal, Categorical
+
+
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from tensorboardX import SummaryWriter
 
@@ -22,61 +22,82 @@ class Net(nn.Module):
     def __init__(self, num_state, num_action):
         super(Net, self).__init__()
         self.fc1 = nn.Linear(num_state, 100)
+        self.activation = nn.LeakyReLU() 
         self.fc2 = nn.Linear(100, num_action)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
+        x = self.activation(self.fc1(x))
         action_prob = self.fc2(x)
         return action_prob
 
-# TODO: sanity check, make sure logic is right. 
-class DQN(nn.Module):
-    capacity = 8000
-    learning_rate = 1e-3
-    memory_count = 0
-    batch_size = 256
-    gamma = 0.995
-    update_count = 0
 
+class DQN():
     def __init__(self, num_state, num_action, params):
         super(DQN, self).__init__()
-        self.target_net, self.act_net = Net(num_state, num_action), Net(num_state, num_action)
-        self.memory = [None]*self.capacity
-        self.optimizer = optim.Adam(self.act_net.parameters(), self.learning_rate)
-        self.loss_func = nn.MSELoss()
-        self.writer = SummaryWriter('./DQN/logs')
-        self.params = params
-        self.num_actions = num_action 
-        self.num_states = num_state
 
+        # data collection aids
+        self.name = 'agents/' + params.env_name + '_' + params.model_name
+        self.losses = []
+        self.params = params 
+        if self.params.mode == 'test':
+            self.load(self.name)
+        else:
+            self.target_net, self.act_net = Net(num_state, num_action), Net(num_state, num_action)
+            self.unpack_params()
+            self.loss_func = nn.MSELoss()
+            self.writer = SummaryWriter('./DQN/logs')
+            self.num_actions = num_action 
+            self.num_states = num_state
+            self.memory_count = 0 
+            self.update_count = 0
+
+    def unpack_params(self):
+        self.epsilon = self.params.exploration_noise
+        self.optimizer = get_optimizer(self.params.optimizer, self.act_net, self.params.learning_rate)
+        self.capacity = self.params.capacity
+        self.memory = [None]*self.capacity
+        self.update_point = self.params.update_count 
+        self.gamma = self.params.gamma
+        self.batch_size = self.params.batch_size
+        self.game = self.params.env_name
 
     def select_action(self,state):
         state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
         value = self.act_net(state)
         action_max_value, index = torch.max(value, 1)
         action = index.item()
-        if np.random.rand(1) >= 0.9: # epslion greedy
-            action = np.random.choice(range(self.num_action), 1).item()
+        if np.random.uniform() >= 1 - self.epsilon: 
+            action = np.random.choice(range(self.num_actions), 1).item()
         return action
 
     def store_transition(self,transition):
         index = self.memory_count % self.capacity
         self.memory[index] = transition
         self.memory_count += 1
-        return self.memory_count >= self.capacity
+    
+    def update_target_network_weights(self):
+        if self.update_count == self.update_point:
+            self.update_count = 0 
+            self.target_net.load_state_dict(self.act_net.state_dict())
 
     def update(self):
         if self.memory_count >= self.capacity:
+
+            # convert inputs to torch tensors. 
             state = torch.Tensor([t.state for t in self.memory]).float()
             action = torch.LongTensor([t.action for t in self.memory]).view(-1,1).long()
             reward = torch.Tensor([t.reward for t in self.memory]).float()
             next_state = torch.Tensor([t.next_state for t in self.memory]).float()
-
+        
+            # normalize rewards. 
             reward = (reward - reward.mean()) / (reward.std() + 1e-7)
+
+            # update Q value
             with torch.no_grad():
                 target_v = reward + self.gamma * self.target_net(next_state).max(1)[0]
-
-            # Update
+            
+            batch_loss = 0
+            # sample from replay buffer, update actor network. 
             for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), batch_size=self.batch_size, drop_last=False):
                 v = (self.act_net(state).gather(1, action))[index]
                 loss = self.loss_func(target_v[index].unsqueeze(1), (self.act_net(state).gather(1, action))[index])
@@ -84,11 +105,63 @@ class DQN(nn.Module):
                 loss.backward()
                 self.optimizer.step()
                 self.writer.add_scalar('loss/value_loss', loss, self.update_count)
-                self.update_count +=1
-                if self.update_count % 100 ==0:
-                    self.target_net.load_state_dict(self.act_net.state_dict())
-        else:
-            print("Too few instances in memory buffer.")
+                batch_loss += loss
+
+            self.losses.append(batch_loss/self.batch_size)
+            
+        # update target Q network when sufficient iterations have passed. 
+        self.update_count +=1
+        self.update_target_network_weights() 
+        if self.update_count == self.update_point:
+            self.target_net.load_state_dict(self.act_net.state_dict())
+    
+    def save(self, ep_number):
+        if not os.path.isdir('agents'):
+            os.mkdir('agents/')
+        act_model_path = 'agents/' + self.params.model_name + '_' + self.game + '_actor_episode' + str(ep_number) + '.pth'
+        target_model_path = 'agents/' + self.params.model_name + '_' + self.game + '_target_episode' + str(ep_number)+ '.pth'
+        torch.save(self.act_net.state_dict(), act_model_path)
+        torch.save(self.target_net.state_dict(), target_model_path)
+
+        save_dic = vars(self.params)
+
+        save_dic['num_actions'] = self.num_actions 
+        save_dic['num_states'] = self.num_states 
+        save_dic['memory_count'] = self.memory_count 
+        save_dic['update_count'] = self.update_count
+        save_dic['losses'] = self.losses
+
+        filename = self.name + '.json'
+        with open(filename, 'w') as fp:
+            json.dump(save_dic, fp, indent=4)
+
+    def load(self, name):
+        # name = 'agents/' + game + '_' + model_name
+        filename = name + '.json'
+        print('loading from : ', filename) 
+        try:
+            with open(filename, 'r') as fp:
+                data = json.load(fp)
+        except FileNotFoundError:
+            raise FileNotFoundError("Specified agent does not exist. Aborting.")
+        
+        self.params = argparse.Namespace(**data)
+        self.num_actions = data['num_actions']
+        self.num_states = data['num_states']
+        ep_number = self.params.num_episodes - 1
+        act_model_path = 'agents/' + self.params.model_name + '_' + self.params.env_name + '_actor_episode' + str(ep_number) + '.pth'
+        target_model_path = 'agents/' + self.params.model_name + '_' + self.params.env_name + '_target_episode' + str(ep_number)+ '.pth'
+
+        # load the models.
+        self.act_net, self.target_net = Net(self.num_states, self.num_actions), Net(self.num_states, self.num_actions)
+        self.act_net.load_state_dict(torch.load(act_model_path))
+        self.target_net.load_state_dict(torch.load(target_model_path))
+        
+        # load other parameters.
+        self.unpack_params() 
+        self.memory_count = data['memory_count']
+        self.update_count = data['update_count']
+        self.losses = data['losses']
 
 
 class Transition(object):
@@ -114,66 +187,96 @@ class Transition(object):
         return self.old_state, self.action, self.new_state, self.reward, self.terminate
 
 
-# TODO: make this work for both discrete and continuous games. 
 def initialize_game(params):
-    env_name = params.env_name
-    # discrete action spaces.
-    if env_name in ['MountainCar-v0', 'CartPole-v0', 'MountainCar-v1', 'LunarLander']:
-        pass
-
-    elif env_name in ['Pendulum-v0', 'LunarLander-Continuous', 'BipedalWalker']:
-        pass 
-    env = gym.make(env_name).unwrapped
-    num_state = 0 
-    num_action = 0
-    dqn = DQN(num_state, num_action, params) 
-    return env, num_state, num_action 
+    env = gym.make(params.env_name).unwrapped
+    num_state = env.observation_space.shape[0]
+    num_action = env.action_space.n
+    dqn = DQN(num_state, num_action, params)
+    return env, num_state, num_action, dqn 
 
 
-# TODO: include funcs to save logfiles etc 
+def get_optimizer(name, net, learning_rate):
+    if name.lower() == 'adam':
+        optimizer = optim.Adam(net.parameters(), learning_rate)
+    elif name.lower() == 'adagrad':
+        optimizer = optim.Adagrad(net.parameters(), learning_rate)
+    elif name.lower() == 'adadelta':
+        optimizer = optim.Adadelta(net.parameters(), learning_rate)
+    elif name.lower() == 'sgd':
+        optimizer = optim.SGD(net.parameters(), learning_rate)
+    elif name.lower() == 'rmsprop':
+        optimizer = optim.RMSprop(net.parameters(), learning_rate)
+    return optimizer 
+
+
+def display_state_action_dims(games):
+    for env_name in games:
+        env = gym.make(env_name).unwrapped
+        num_state = env.observation_space.shape[0]
+        num_action = env.action_space.n
+        print("%s | num_states : %s | num_actions: %s" % (env_name, num_state, num_action))
+
+
 def main(params):
-    env, num_state, num_action, DQN = initialize_game(params)
-    agent = DQN()
+    env, num_state, num_action, agent = initialize_game(params)
     for i_ep in range(params.num_episodes):
         state = env.reset()
         if params.render: env.render()
-        for t in range(10000):
+        if i_ep % (params.log_interval-1) == 0 and i_ep > 0:
+            agent.save(i_ep)
+        for t in range(params.num_iterations):
             action = agent.select_action(state)
             next_state, reward, done, info = env.step(action)
             if params.render: env.render()
             transition = Transition(state, action, next_state, reward, done)
             agent.store_transition(transition)
-            state = next_state
-            if done or t >=9999:
-                agent.writer.add_scalar('live/finish_step', t+1, global_step=i_ep)
-                agent.update()
-                if i_ep % 10 == 0:
-                    print("episodes {}, step is {} ".format(i_ep, t))
+            agent.update()
+        
+        if i_ep % 10 == 9:
+            print("episode {},  iteration {} ".format(i_ep, t))
 
 
 # TODO: figure out which of these are unnecessary.
 if __name__ == "__main__":
+
+    supported_games = ['MountainCar-v0',
+                       'CartPole-v0',
+                       'LunarLander-v2',
+                       'Acrobot-v1',
+                       'Breakout-ram-v0',
+                       'AirRaid-ram-v0',
+                       'Alien-ram-v0',
+                       'Assault-ram-v0',
+                       'Asteroids-ram-v0',
+                       'SpaceInvaders-ram-v0',
+                       'Tennis-ram-v0',
+                       'Pong-ram-v0',
+                       'MsPacman-ram-v0',
+                       'MontezumaRevenge-ram-v0',
+                       'Centipede-ram-v0']
+    
+    display_state_action_dims(supported_games)
 
     # parse arguments. 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', default='train', type=str) # mode = 'train' or 'test'
 
-    # Supported Envs:
-    # 1. Discrete: ['CartPole-v0', 'MountainCar-v0', 'LunarLander', 'Acrobot']
-    # 2. Continuous: ['MountainCarContinuous-v0', 'LunarLanderContinuous', 'BipedalWalker', 'Pendulum-v0']
-    parser.add_argument("--env_name", default="CartPole-v0")
-
     # model parameters. 
-    parser.add_argument('--update_count', default=150, type=int)
-    parser.add_argument('--learning_rate', default=3e-4, type=float)
+    parser.add_argument('--env_name', default='MountainCar-v0',)
+    parser.add_argument('--update_count', default=150, type=int) # number of iterations before transferring weights. 
+    parser.add_argument('--learning_rate', default=3e-4, type=float) # learning rate for networks. 
     parser.add_argument('--gamma', default=0.99, type=int) # discounted factor
     parser.add_argument('--capacity', default=50000, type=int) # replay buffer size
-    parser.add_argument('--num_iteration', default=100000, type=int) #  num of  games
+    parser.add_argument('--num_iterations', default=10, type=int) #  num of iterations per episode
     parser.add_argument('--batch_size', default=100, type=int) # mini batch size
-    parser.add_argument('--seed', default=True, type=bool)
+    parser.add_argument('--seed', default=True, type=bool) 
     parser.add_argument('--random_seed', default=9527, type=int)
-    parser.add_argument('--sample_type', default='uniform', type=str)
+    parser.add_argument('--sample_type', default='uniform', type=str) # uniform or prioritized - can consider if we have the time. 
+    parser.add_argument('--exploration_noise', default=0.1, type=float) # epsilon for epsilon-greedy policy. 
+    parser.add_argument('--num_episodes', default=50, type=int) # number of episodes.
+    parser.add_argument('--optimizer', default='adam', type=str) # optimizer to be used. 
+    parser.add_argument('--model_name', default='default_dqn', type=str)
 
     # optional parameters
     parser.add_argument('--num_hidden_layers', default=2, type=int)
@@ -185,12 +288,10 @@ if __name__ == "__main__":
     parser.add_argument('--policy_noise', default=0.2, type=float)
     parser.add_argument('--noise_clip', default=0.5, type=float)
     parser.add_argument('--policy_delay', default=2, type=int)
-    parser.add_argument('--exploration_noise', default=0.1, type=float)
+    
     args = parser.parse_args()
 
-    print(args)
-
-    # # pass args into the main function 
-    # main(args)
+    # pass args into the main function 
+    main(args)
     
 
