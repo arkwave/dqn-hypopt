@@ -21,9 +21,9 @@ from tensorboardX import SummaryWriter
 class Net(nn.Module):
     def __init__(self, num_state, num_action):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(num_state, 100)
+        self.fc1 = nn.Linear(num_state, 512)
         self.activation = nn.LeakyReLU() 
-        self.fc2 = nn.Linear(100, num_action)
+        self.fc2 = nn.Linear(256, num_action)
 
     def forward(self, x):
         x = self.activation(self.fc1(x))
@@ -35,14 +35,17 @@ class DQN():
     def __init__(self, num_state, num_action, params):
         super(DQN, self).__init__()
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # data collection aids
         self.name = 'agents/' + params.env_name + '_' + params.model_name
         self.losses = []
+        self.rewards = []
         self.params = params 
         if self.params.mode == 'test':
             self.load(self.name)
         else:
             self.target_net, self.act_net = Net(num_state, num_action), Net(num_state, num_action)
+            self.target_net, self.act_net = self.target_net.to(self.device), self.act_net.to(self.device)
             self.unpack_params()
             self.loss_func = nn.MSELoss()
             self.writer = SummaryWriter('./DQN/logs')
@@ -63,6 +66,7 @@ class DQN():
 
     def select_action(self,state):
         state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        state = state.to(self.device)
         value = self.act_net(state)
         action_max_value, index = torch.max(value, 1)
         action = index.item()
@@ -88,7 +92,13 @@ class DQN():
             action = torch.LongTensor([t.action for t in self.memory]).view(-1,1).long()
             reward = torch.Tensor([t.reward for t in self.memory]).float()
             next_state = torch.Tensor([t.new_state for t in self.memory]).float()
-        
+
+            # move to device. 
+            state = state.to(self.device)
+            action = action.to(self.device)
+            reward = reward.to(self.device)
+            next_state = next_state.to(self.device)
+
             # normalize rewards. 
             reward = (reward - reward.mean()) / (reward.std() + 1e-7)
 
@@ -106,14 +116,15 @@ class DQN():
                 self.optimizer.step()
                 self.writer.add_scalar('loss/value_loss', loss, self.update_count)
                 batch_loss += loss.item()
-
             self.losses.append(batch_loss/self.batch_size)
+            self.rewards.append(reward.mean().item())
             
         # update target Q network when sufficient iterations have passed. 
         self.update_count +=1
         self.update_target_network_weights() 
-        if self.update_count == self.update_point:
-            self.target_net.load_state_dict(self.act_net.state_dict())
+        # if self.update_count == self.update_point:
+        #     print("updating target net params")
+        #     self.target_net.load_state_dict(self.act_net.state_dict())
     
     def save(self, ep_number):
         if not os.path.isdir('agents'):
@@ -130,6 +141,7 @@ class DQN():
         save_dic['memory_count'] = self.memory_count 
         save_dic['update_count'] = self.update_count
         save_dic['losses'] = self.losses
+        save_dic['rewards'] = self.rewards
 
         filename = self.name + '.json'
         with open(filename, 'w') as fp:
@@ -154,6 +166,7 @@ class DQN():
 
         # load the models.
         self.act_net, self.target_net = Net(self.num_states, self.num_actions), Net(self.num_states, self.num_actions)
+        self.act_net, self.target_net = self.act_net.to(self.device), self.target_net.to(self.device)
         self.act_net.load_state_dict(torch.load(act_model_path))
         self.target_net.load_state_dict(torch.load(target_model_path))
         
@@ -162,6 +175,13 @@ class DQN():
         self.memory_count = data['memory_count']
         self.update_count = data['update_count']
         self.losses = data['losses']
+        self.rewards = data['rewards']
+    
+    def get_losses(self):
+        return self.losses
+    
+    def get_rewards(self):
+        return self.rewards
 
 
 class Transition(object):
@@ -217,11 +237,16 @@ def display_state_action_dims(games):
         print("%s | num_states : %s | num_actions: %s" % (env_name, num_state, num_action))
 
 
-def main(params):
+def run(params):
+    # params = argparse.Namespace(**params)
+    # print(params)
     env, num_state, num_action, agent = initialize_game(params)
+    all_rewards = []
     for i_ep in range(params.num_episodes):
         state = env.reset()
-        if params.render: env.render()
+        if i_ep == params.num_episodes - 1:
+            if params.render:
+                env.render()
         if i_ep % (params.log_interval-1) == 0 and i_ep > 0:
             agent.save(i_ep)
         for t in range(params.num_iterations):
@@ -231,10 +256,8 @@ def main(params):
             transition = Transition(state, action, next_state, reward, done)
             agent.store_transition(transition)
             agent.update()
+            all_rewards.append(reward)
         
-        if i_ep % 10 == 9:
-            print("episode {},  iteration {} ".format(i_ep, t))
-    
     return agent 
 
 
@@ -270,13 +293,13 @@ if __name__ == "__main__":
     parser.add_argument('--learning_rate', default=3e-4, type=float) # learning rate for networks. 
     parser.add_argument('--gamma', default=0.99, type=int) # discounted factor
     parser.add_argument('--capacity', default=10, type=int) # replay buffer size
-    parser.add_argument('--num_iterations', default=10, type=int) #  num of iterations per episode
+    parser.add_argument('--num_iterations', default=1000, type=int) #  num of iterations per episode
     parser.add_argument('--batch_size', default=100, type=int) # mini batch size
     parser.add_argument('--seed', default=True, type=bool) 
     parser.add_argument('--random_seed', default=9527, type=int)
     parser.add_argument('--sample_type', default='uniform', type=str) # uniform or prioritized - can consider if we have the time. 
     parser.add_argument('--exploration_noise', default=0.1, type=float) # epsilon for epsilon-greedy policy. 
-    parser.add_argument('--num_episodes', default=50, type=int) # number of episodes.
+    parser.add_argument('--num_episodes', default=100, type=int) # number of episodes.
     parser.add_argument('--optimizer', default='adam', type=str) # optimizer to be used. 
     parser.add_argument('--model_name', default='default_dqn', type=str)
 
@@ -293,7 +316,33 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    # params = {
+    #         'mode':'train',
+    #         'render': False,
+    #         'log_interval': 100,
+    #         'env_name': 'MountainCar-v0',
+    #         'num_iterations': 100, 
+    #         'num_episodes': 100,
+    #         'exploration_noise': 0.1, 
+    #         'capacity':10000,
+    #         'model_name': 'trial_model',
+    #         'update_count': 100,
+    #         'gamma': 0.5,
+    #         'batch_size': 128,
+    #         'optimizer': 'adam',
+    #         'learning_rate': 0.001
+    #     }
+
+
     # pass args into the main function 
-    agent = main(args)
+    agent = run(args)
+
+    env = gym.make(args.env_name)
+    while True:
+     state = env.reset()
+     env.render() 
+     for t in range(args.num_iterations):
+            action = agent.select_action(state)
+            next_state, reward, done, info = env.step(action)
     
 
