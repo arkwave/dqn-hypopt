@@ -14,16 +14,15 @@ import torch.optim as optim
 
 
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-from tensorboardX import SummaryWriter
 
 # taken from https://github.com/sweetice/Deep-reinforcement-learning-with-pytorch, with heavy modifications.
 
 class Net(nn.Module):
     def __init__(self, num_state, num_action):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(num_state, 512)
+        self.fc1 = nn.Linear(num_state, 100)
         self.activation = nn.LeakyReLU() 
-        self.fc2 = nn.Linear(256, num_action)
+        self.fc2 = nn.Linear(100, num_action)
 
     def forward(self, x):
         x = self.activation(self.fc1(x))
@@ -48,7 +47,6 @@ class DQN():
             self.target_net, self.act_net = self.target_net.to(self.device), self.act_net.to(self.device)
             self.unpack_params()
             self.loss_func = nn.MSELoss()
-            self.writer = SummaryWriter('./DQN/logs')
             self.num_actions = num_action 
             self.num_states = num_state
             self.memory_count = 0 
@@ -63,6 +61,7 @@ class DQN():
         self.gamma = self.params.gamma
         self.batch_size = self.params.batch_size
         self.game = self.params.env_name
+        self.epsilon_decay = self.params.epsilon_decay 
 
     def select_action(self,state):
         state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
@@ -70,7 +69,7 @@ class DQN():
         value = self.act_net(state)
         action_max_value, index = torch.max(value, 1)
         action = index.item()
-        if np.random.uniform() >= 1 - self.epsilon: 
+        if np.random.uniform() <= self.epsilon: 
             action = np.random.choice(range(self.num_actions), 1).item()
         return action
 
@@ -78,6 +77,9 @@ class DQN():
         index = self.memory_count % self.capacity
         self.memory[index] = transition
         self.memory_count += 1
+
+    def update_epsilon(self):
+        self.epsilon *= self.epsilon_decay
     
     def update_target_network_weights(self):
         if self.update_count == self.update_point:
@@ -107,6 +109,7 @@ class DQN():
                 target_v = reward + self.gamma * self.target_net(next_state).max(1)[0]
             
             batch_loss = 0
+
             # sample from replay buffer, update actor network. 
             for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), batch_size=self.batch_size, drop_last=False):
                 v = (self.act_net(state).gather(1, action))[index]
@@ -114,17 +117,14 @@ class DQN():
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                self.writer.add_scalar('loss/value_loss', loss, self.update_count)
                 batch_loss += loss.item()
+                
+                # update target Q network when sufficient iterations have passed. 
+                self.update_count +=1
+                self.update_target_network_weights()
+
             self.losses.append(batch_loss/self.batch_size)
             self.rewards.append(reward.mean().item())
-            
-        # update target Q network when sufficient iterations have passed. 
-        self.update_count +=1
-        self.update_target_network_weights() 
-        # if self.update_count == self.update_point:
-        #     print("updating target net params")
-        #     self.target_net.load_state_dict(self.act_net.state_dict())
     
     def save(self, ep_number):
         if not os.path.isdir('agents'):
@@ -237,28 +237,30 @@ def display_state_action_dims(games):
         print("%s | num_states : %s | num_actions: %s" % (env_name, num_state, num_action))
 
 
-def run(params):
-    # params = argparse.Namespace(**params)
-    # print(params)
+def run(params, return_agent=False):
     env, num_state, num_action, agent = initialize_game(params)
     all_rewards = []
     for i_ep in range(params.num_episodes):
         state = env.reset()
-        if i_ep == params.num_episodes - 1:
-            if params.render:
-                env.render()
-        if i_ep % (params.log_interval-1) == 0 and i_ep > 0:
-            agent.save(i_ep)
+        if i_ep % 10 == 0 and i_ep > 0:
+            print("episode: %s" % i_ep)
+        # if i_ep % (params.log_interval-1) == 0 and i_ep > 0:
+        #     agent.save(i_ep)
         for t in range(params.num_iterations):
             action = agent.select_action(state)
             next_state, reward, done, info = env.step(action)
             if params.render: env.render()
             transition = Transition(state, action, next_state, reward, done)
             agent.store_transition(transition)
-            agent.update()
+            if (done or t == params.num_iterations - 1): 
+                agent.update()
             all_rewards.append(reward)
-        
-    return agent 
+            agent.update_epsilon()
+
+    if return_agent:
+        return agent 
+    else:
+        return -np.mean(all_rewards)
 
 
 # TODO: figure out which of these are unnecessary.
