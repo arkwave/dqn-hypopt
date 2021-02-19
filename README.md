@@ -3,7 +3,7 @@ Final Project for COMS 6998 Deep Learning Systems Performance at Columbia Univer
 
 Collaborator: **In Wai Cheong** (https://www.github.com/InwaiCheong) <br>
 
-References: https://github.com/sweetice/Deep-reinforcement-learning-with-pytorch (modified DQN files from this repo)
+References: https://github.com/sweetice/Deep-reinforcement-learning-with-pytorch (heavily modified the DQN files from this repo)
 
 
 ## Projection Description
